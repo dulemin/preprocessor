@@ -25,66 +25,81 @@ class DocumentType(Enum):
 @dataclass
 class ProcessingConfig:
     """Konfiguration für verschiedene Dokumenttypen."""
-    # Grundeinstellungen
-    target_width: int = 1800  # Reduziert von 2000
-    angle_limit: float = 10.0  # Reduziert von 15.0
+    # Grundeinstellungen - OCR-optimiert
+    target_width: int = 2400  # Höher für bessere kleine Zeichen
+    target_dpi: int = 300  # Tesseract-optimiert
+    angle_limit: float = 10.0
     
     # Rauschunterdrückung
-    noise_reduction_strength: float = 0.8  # Reduziert von 1.2
-    bilateral_d: int = 5  # Reduziert von 9
-    bilateral_sigma_color: float = 50  # Reduziert von 75
-    bilateral_sigma_space: float = 50  # Reduziert von 75
+    noise_reduction_strength: float = 0.8
+    bilateral_d: int = 5
+    bilateral_sigma_color: float = 50
+    bilateral_sigma_space: float = 50
     
     # Kontrast & Helligkeit
-    clahe_clip_limit: float = 2.0  # Reduziert von 3.0
-    clahe_tile_grid: Tuple[int, int] = (6, 6)  # Reduziert von (8, 8)
-    gamma_correction: float = 1.1  # Reduziert von 1.2
+    clahe_clip_limit: float = 2.0
+    clahe_tile_grid: Tuple[int, int] = (6, 6)
+    gamma_correction: float = 1.1
     
-    # Morphologie (sehr sanft)
-    opening_kernel_size: int = 1  # Reduziert von 2
-    closing_kernel_size: int = 1  # Bleibt bei 1
+    # Morphologie - OCR-optimiert
+    opening_kernel_size: int = 1
+    closing_kernel_size: int = 2  # Erhöht für bessere Buchstabenverbindung
     
-    # Schärfung (sanfter)
-    unsharp_radius: float = 1.0  # Reduziert von 1.5
-    unsharp_percent: int = 120  # Reduziert von 150
-    unsharp_threshold: int = 5  # Erhöht von 3
+    # Schärfung - OCR-optimiert
+    unsharp_radius: float = 0.8  # Kleiner für feine Details
+    unsharp_percent: int = 140
+    unsharp_threshold: int = 2  # Niedrig für mehr Schärfung
     
     # Features
-    use_shadow_removal: bool = True  # Wieder aktiviert für Beleuchtungskorrektur
-    use_deblurring: bool = False  # Bleibt aus
+    use_shadow_removal: bool = True
+    use_deblurring: bool = False
+    
+    # OCR-spezifische Parameter
+    use_text_enhancement: bool = True  # Neu!
+    min_text_height: int = 8  # Minimale Texthöhe in Pixel
 
-# Konfigurationen für verschiedene Dokumenttypen
+# Konfigurationen für verschiedene Dokumenttypen - OCR-optimiert
 CONFIGS = {
     DocumentType.SCANNED: ProcessingConfig(
         noise_reduction_strength=0.5,
         gamma_correction=1.0,
         use_deblurring=False,
         use_shadow_removal=False,  # Gescannte haben meist gleichmäßige Beleuchtung
-        clahe_clip_limit=1.5
+        clahe_clip_limit=1.5,
+        use_text_enhancement=True,
+        target_width=2200  # Etwas niedriger für bereits saubere Scans
     ),
     DocumentType.PHOTOGRAPHED: ProcessingConfig(
         noise_reduction_strength=1.0,
         gamma_correction=1.2,
-        use_deblurring=False,  # Bleibt aus
+        use_deblurring=False,
         use_shadow_removal=True,  # Wichtig für Fotos!
-        clahe_clip_limit=2.5
+        clahe_clip_limit=2.5,
+        use_text_enhancement=True,
+        target_width=2600  # Höher für Fotos
     ),
     DocumentType.HANDWRITTEN: ProcessingConfig(
-        target_width=2000,
+        target_width=2800,  # Höchste Auflösung für Handschrift
         opening_kernel_size=1,
-        closing_kernel_size=1,
-        unsharp_percent=140,
+        closing_kernel_size=3,  # Mehr Closing für Handschrift
+        unsharp_percent=160,  # Stärkere Schärfung
+        unsharp_threshold=1,   # Niedrigere Schwelle
         clahe_clip_limit=1.8,
-        use_shadow_removal=True  # Oft ungleichmäßig beleuchtet
+        use_shadow_removal=True,
+        use_text_enhancement=True
     ),
     DocumentType.PRINTED: ProcessingConfig(
         noise_reduction_strength=0.6,
         gamma_correction=1.05,
-        unsharp_percent=110,
-        use_shadow_removal=True  # Auch für gedruckte Dokumente
+        unsharp_percent=130,
+        use_shadow_removal=True,
+        use_text_enhancement=True,
+        target_width=2400
     ),
     DocumentType.MIXED: ProcessingConfig(
-        use_shadow_removal=True  # Standard aktiviert
+        use_shadow_removal=True,
+        use_text_enhancement=True,
+        target_width=2400
     )
 }
 
@@ -129,6 +144,142 @@ class StableImageProcessor:
             logger.warning(f"Dokumenttyp-Erkennung fehlgeschlagen: {e}")
             return DocumentType.MIXED
     
+        """
+        Spezielle Text-Enhancement für bessere OCR-Erkennung.
+        Verbessert kleine Zeichen wie 'g', 'q', 'p' die oft falsch erkannt werden.
+        """
+        try:
+            # 1. Leichte Dilatation um Buchstaben zu verstärken
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+            dilated = cv2.dilate(img, kernel, iterations=1)
+            
+            # 2. Strukturerhaltende Glättung für bessere Buchstabenformen
+            smoothed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, 
+                                      cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1)))
+            
+            # 3. Vertikale Strukturen verstärken (wichtig für g, q, p, y)
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+            vertical_enhanced = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, vertical_kernel)
+            
+            # 4. Gewichtete Mischung: 70% enhanced, 30% original
+            result = cv2.addWeighted(vertical_enhanced, 0.7, img, 0.3, 0)
+            
+            return result.astype(np.uint8)
+            
+        except Exception as e:
+            logger.warning(f"Text-Enhancement fehlgeschlagen: {e}")
+            return img
+    
+    def intelligent_scaling_for_ocr(self, img: Image.Image) -> Image.Image:
+        """
+        Intelligente Skalierung optimiert für OCR.
+        Stellt sicher, dass Text mindestens 20-25 Pixel hoch ist.
+        """
+        try:
+            # Schätze durchschnittliche Texthöhe
+            img_array = np.array(img.convert('L'))
+            
+            # Finde horizontale Linien (Text-Zeilen)
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            horizontal_lines = cv2.morphologyEx(255 - img_array, cv2.MORPH_OPEN, horizontal_kernel)
+            
+            # Finde Konturen der Text-Zeilen
+            contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Berechne durchschnittliche Höhe der Text-Zeilen
+                heights = []
+                for contour in contours:
+                    _, _, _, h = cv2.boundingRect(contour)
+                    if h > 5:  # Ignoriere zu kleine Konturen
+                        heights.append(h)
+                
+                if heights:
+                    avg_text_height = np.median(heights)
+                    
+                    # Ziel: Text sollte mindestens 20-25 Pixel hoch sein
+                    target_text_height = 22
+                    
+                    if avg_text_height < target_text_height:
+                        scale_factor = target_text_height / avg_text_height
+                        # Begrenze Skalierung auf vernünftige Werte
+                        scale_factor = min(scale_factor, 3.0)  # Max 3x
+                        
+                        new_size = (
+                            int(img.width * scale_factor),
+                            int(img.height * scale_factor)
+                        )
+                        
+                        logger.info(f"OCR-Skalierung: {avg_text_height:.1f}px → {target_text_height}px (Faktor: {scale_factor:.2f})")
+                        return img.resize(new_size, Image.LANCZOS)
+            
+            # Fallback: Standard-Skalierung
+            if img.width < self.config.target_width:
+                scale = self.config.target_width / img.width
+                new_size = (int(img.width * scale), int(img.height * scale))
+                return img.resize(new_size, Image.LANCZOS)
+            
+            return img
+            
+        except Exception as e:
+            logger.warning(f"OCR-Skalierung fehlgeschlagen: {e}")
+            return self._scale_image(img)
+        """
+        Einfache Dokumenttyp-Erkennung nur mit OpenCV.
+        """
+        try:
+            h, w = img_gray.shape
+            
+            # Kantendichte
+            edges = cv2.Canny(img_gray, 50, 150)
+            edge_density = np.sum(edges > 0) / edges.size
+            
+            # Rauschmaß (Laplacian Variance)
+            laplacian_var = cv2.Laplacian(img_gray, cv2.CV_64F).var()
+            
+            # Helligkeit
+            mean_brightness = np.mean(img_gray)
+            
+            # Einfache Klassifikation
+            if edge_density < 0.02 and laplacian_var > 1000 and mean_brightness > 200:
+                return DocumentType.SCANNED
+            elif edge_density > 0.05 and laplacian_var < 500:
+                return DocumentType.PHOTOGRAPHED
+            elif mean_brightness < 150 and edge_density > 0.03:
+                return DocumentType.HANDWRITTEN
+            elif edge_density > 0.025 and laplacian_var > 800:
+                return DocumentType.PRINTED
+            else:
+                return DocumentType.MIXED
+                
+        except Exception as e:
+            logger.warning(f"Dokumenttyp-Erkennung fehlgeschlagen: {e}")
+            return DocumentType.MIXED
+    
+    
+    def enhance_text_for_ocr(self, img: np.ndarray) -> np.ndarray:
+        """Stabile Rauschunterdrückung nur mit OpenCV."""
+        try:
+            # Bilateral Filter
+            denoised = cv2.bilateralFilter(
+                img, 
+                self.config.bilateral_d,
+                self.config.bilateral_sigma_color,
+                self.config.bilateral_sigma_space
+            )
+            
+            # Zusätzliches Gaussian Blur bei starkem Rauschen
+            if self.config.noise_reduction_strength > 1.0:
+                kernel_size = int(self.config.noise_reduction_strength * 2) | 1  # ungerade Zahl
+                denoised = cv2.GaussianBlur(denoised, (kernel_size, kernel_size), 0)
+            
+            return denoised
+            
+        except Exception as e:
+            logger.warning(f"Rauschunterdrückung fehlgeschlagen: {e}")
+            return img
+    
+    
     def stable_noise_reduction(self, img: np.ndarray) -> np.ndarray:
         """Stabile Rauschunterdrückung nur mit OpenCV."""
         try:
@@ -152,7 +303,6 @@ class StableImageProcessor:
             return img
     
     def remove_shadows_stable(self, img: np.ndarray) -> np.ndarray:
-        """Sanfte Schatten-/Beleuchtungskorrektur für ungleichmäßige Beleuchtung."""
         try:
             # Kleinerer Kernel für sanftere Background-Schätzung
             kernel_size = min(img.shape[0], img.shape[1]) // 30  # Kleiner als vorher (war //20)
@@ -355,8 +505,8 @@ class StableImageProcessor:
                 img = ImageOps.exif_transpose(img).convert("RGB")
                 logger.info(f"Originalgröße: {img.size}")
             
-            # 2. Skalierung
-            img = self._scale_image(img)
+            # 2. OCR-optimierte Skalierung
+            img = self.intelligent_scaling_for_ocr(img)
             
             # 3. OpenCV Konvertierung
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -398,12 +548,17 @@ class StableImageProcessor:
             white_ratio = np.sum(binary_img == 255) / binary_img.size
             logger.info(f"Binarisierung: {white_ratio:.2%} weiße Pixel")
             
+            # 11. OCR-spezifische Text-Enhancement
+            if self.config.use_text_enhancement and white_ratio < 0.95:
+                binary_img = self.enhance_text_for_ocr(binary_img)
+                logger.info("Text-Enhancement für OCR angewendet")
+            
             # Wenn zu weiß, überspringe Morphologie und Schärfung
             if white_ratio < 0.95:
-                # 11. Sehr sanfte Morphologie
+                # 12. Sehr sanfte Morphologie
                 binary_img = self._morphology_cleanup(binary_img)
                 
-                # 12. Sanfte Schärfung
+                # 13. Sanfte Schärfung
                 final_img = self._sharpen_pil(binary_img)
             else:
                 logger.warning("Bild zu weiß, überspringe Nachbearbeitung")
@@ -412,9 +567,18 @@ class StableImageProcessor:
                 _, binary_img = cv2.threshold(img_gray, threshold_val, 255, cv2.THRESH_BINARY)
                 final_img = Image.fromarray(binary_img)
             
-            # 13. Export
+            # 13. Optimierter PNG-Export für OCR
             output_buffer = io.BytesIO()
-            final_img.save(output_buffer, format="PNG", optimize=True, compress_level=6)
+            
+            # Setze DPI-Info für Tesseract
+            dpi_info = (self.config.target_dpi, self.config.target_dpi)
+            final_img.save(
+                output_buffer, 
+                format="PNG", 
+                optimize=True, 
+                compress_level=6,
+                dpi=dpi_info
+            )
             
             result_bytes = output_buffer.getvalue()
             logger.info(f"Verarbeitung OK. Größe: {len(result_bytes)} bytes")
@@ -504,11 +668,11 @@ class StableImageProcessor:
             return img
     
     def _sharpen_pil(self, img_array: np.ndarray) -> Image.Image:
-        """PIL-basierte Schärfung."""
+        """OCR-optimierte Schärfung mit mehreren Techniken."""
         try:
             pil_img = Image.fromarray(img_array)
             
-            # Unsharp Mask
+            # 1. Unsharp Mask für allgemeine Schärfung
             sharpened = pil_img.filter(
                 ImageFilter.UnsharpMask(
                     radius=self.config.unsharp_radius,
@@ -517,14 +681,27 @@ class StableImageProcessor:
                 )
             )
             
-            # Kontrast
-            enhancer = ImageEnhance.Contrast(sharpened)
-            enhanced = enhancer.enhance(1.05)
+            # 2. Zusätzliche Edge-Enhancement für OCR
+            enhanced = sharpened.filter(ImageFilter.EDGE_ENHANCE_MORE)
             
-            return enhanced
+            # 3. Gewichtete Mischung: 80% sharpened, 20% edge-enhanced
+            sharpened_array = np.array(sharpened)
+            enhanced_array = np.array(enhanced)
+            
+            # Verhindere Überbelichtung
+            mixed = cv2.addWeighted(sharpened_array, 0.8, enhanced_array, 0.2, 0)
+            mixed = np.clip(mixed, 0, 255).astype(np.uint8)
+            
+            result = Image.fromarray(mixed)
+            
+            # 4. Leichte Kontrastverbesserung
+            enhancer = ImageEnhance.Contrast(result)
+            final = enhancer.enhance(1.05)  # Nur 5% mehr Kontrast
+            
+            return final
             
         except Exception as e:
-            logger.warning(f"Schärfung fehlgeschlagen: {e}")
+            logger.warning(f"OCR-Schärfung fehlgeschlagen: {e}")
             return Image.fromarray(img_array)
 
 
