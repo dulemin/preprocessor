@@ -3,11 +3,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps, ImageFilter
 
-
 def _pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
     """
     Robust: gibt bei Graubild ein 2D-Array (H x W, uint8) zurück,
-    bei Farb­bild ein BGR-Array (H x W x 3, uint8).
+    bei Farbbild ein BGR-Array (H x W x 3, uint8).
     """
     arr = np.array(pil_img, dtype=np.uint8)
     if arr.ndim == 2:  # already grayscale (L)
@@ -16,12 +15,10 @@ def _pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
         arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-
 def _cv2_to_pil(img: np.ndarray) -> Image.Image:
     if img.ndim == 2:  # grayscale
         return Image.fromarray(img)
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
 
 def _deskew_cv(img_gray: np.ndarray) -> np.ndarray:
     """
@@ -51,8 +48,7 @@ def _deskew_cv(img_gray: np.ndarray) -> np.ndarray:
                           flags=cv2.INTER_CUBIC,
                           borderMode=cv2.BORDER_REPLICATE)
 
-
-def preprocess_image(file_bytes: bytes) -> bytes:
+def process_photo(file_bytes: bytes) -> bytes:
     # 1) Laden mit PIL (EXIF-Orientation beachten)
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGB")  # normalisieren
