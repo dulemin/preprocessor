@@ -4,6 +4,10 @@ from app.pipelines.scan import process_scan
 
 app = FastAPI()
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
 @app.post("/foto")
 def endpoint_foto(file: UploadFile = File(...)):
     return Response(process_photo(file.file.read()), media_type="image/png")
