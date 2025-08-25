@@ -50,37 +50,42 @@ class ProcessingConfig:
     unsharp_threshold: int = 5  # Erhöht von 3
     
     # Features
-    use_shadow_removal: bool = False  # Standardmäßig aus
-    use_deblurring: bool = False  # Standardmäßig aus
+    use_shadow_removal: bool = True  # Wieder aktiviert für Beleuchtungskorrektur
+    use_deblurring: bool = False  # Bleibt aus
 
 # Konfigurationen für verschiedene Dokumenttypen
 CONFIGS = {
     DocumentType.SCANNED: ProcessingConfig(
-        noise_reduction_strength=0.8,
+        noise_reduction_strength=0.5,
         gamma_correction=1.0,
         use_deblurring=False,
-        use_shadow_removal=False
+        use_shadow_removal=False,  # Gescannte haben meist gleichmäßige Beleuchtung
+        clahe_clip_limit=1.5
     ),
     DocumentType.PHOTOGRAPHED: ProcessingConfig(
-        noise_reduction_strength=1.5,
-        gamma_correction=1.3,
-        use_deblurring=True,
-        use_shadow_removal=True,
-        clahe_clip_limit=4.0
-    ),
-    DocumentType.HANDWRITTEN: ProcessingConfig(
-        target_width=2400,
-        opening_kernel_size=1,
-        closing_kernel_size=2,
-        unsharp_percent=180,
+        noise_reduction_strength=1.0,
+        gamma_correction=1.2,
+        use_deblurring=False,  # Bleibt aus
+        use_shadow_removal=True,  # Wichtig für Fotos!
         clahe_clip_limit=2.5
     ),
-    DocumentType.PRINTED: ProcessingConfig(
-        noise_reduction_strength=1.0,
-        gamma_correction=1.1,
-        unsharp_percent=120
+    DocumentType.HANDWRITTEN: ProcessingConfig(
+        target_width=2000,
+        opening_kernel_size=1,
+        closing_kernel_size=1,
+        unsharp_percent=140,
+        clahe_clip_limit=1.8,
+        use_shadow_removal=True  # Oft ungleichmäßig beleuchtet
     ),
-    DocumentType.MIXED: ProcessingConfig()
+    DocumentType.PRINTED: ProcessingConfig(
+        noise_reduction_strength=0.6,
+        gamma_correction=1.05,
+        unsharp_percent=110,
+        use_shadow_removal=True  # Auch für gedruckte Dokumente
+    ),
+    DocumentType.MIXED: ProcessingConfig(
+        use_shadow_removal=True  # Standard aktiviert
+    )
 }
 
 logger = logging.getLogger(__name__)
@@ -147,22 +152,28 @@ class StableImageProcessor:
             return img
     
     def remove_shadows_stable(self, img: np.ndarray) -> np.ndarray:
-        """Stabile Schatten-/Beleuchtungskorrektur."""
+        """Sanfte Schatten-/Beleuchtungskorrektur für ungleichmäßige Beleuchtung."""
         try:
-            # Background-Schätzung mit Morphologie
-            kernel_size = max(img.shape[0], img.shape[1]) // 20
+            # Kleinerer Kernel für sanftere Background-Schätzung
+            kernel_size = min(img.shape[0], img.shape[1]) // 30  # Kleiner als vorher (war //20)
+            kernel_size = max(kernel_size, 15)  # Mindestgröße
+            
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             background = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
             
-            # Division für Normalisierung
+            # Sanftere Division durch Gewichtung mit Original
             normalized = cv2.divide(img, background, scale=255)
             
-            # CLAHE
+            # Gewichtete Mischung: 70% korrigiert, 30% original
+            alpha = 0.7
+            mixed = cv2.addWeighted(normalized, alpha, img, 1-alpha, 0)
+            
+            # Sanftere CLAHE
             clahe = cv2.createCLAHE(
-                clipLimit=self.config.clahe_clip_limit,
+                clipLimit=self.config.clahe_clip_limit * 0.8,  # 20% sanfter
                 tileGridSize=self.config.clahe_tile_grid
             )
-            enhanced = clahe.apply(normalized)
+            enhanced = clahe.apply(mixed.astype(np.uint8))
             
             return enhanced
             
@@ -293,37 +304,46 @@ class StableImageProcessor:
             return None
     
     def multi_threshold_stable(self, img: np.ndarray) -> np.ndarray:
-        """Sanfte Binarisierung mit Fallback."""
+        """Verbesserte Binarisierung für ungleichmäßig beleuchtete Bilder."""
         try:
-            # Erst versuchen: Einfaches Adaptive Threshold
+            # Für ungleichmäßige Beleuchtung: Größeres Fenster und sanftere Parameter
+            block_size = max(31, min(img.shape) // 15)  # Adaptieve Fenstergröße
+            if block_size % 2 == 0:  # Muss ungerade sein
+                block_size += 1
+            
+            # Sanfteres C (weniger aggressiv)
+            C = 8  # Sanfter als 10
+            
             result = cv2.adaptiveThreshold(
                 img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 31, 10
+                cv2.THRESH_BINARY, block_size, C
             )
             
-            # Prüfe ob Ergebnis nicht komplett weiß/schwarz ist
+            # Prüfe Ergebnis
             white_ratio = np.sum(result == 255) / result.size
             black_ratio = np.sum(result == 0) / result.size
             
-            # Wenn zu extrem, verwende sanftere Einstellungen
+            logger.info(f"Binarisierung: {white_ratio:.2%} weiß, {black_ratio:.2%} schwarz")
+            
+            # Wenn immer noch zu extrem, verwende gemischten Ansatz
             if white_ratio > 0.95 or black_ratio > 0.95:
-                logger.warning(f"Threshold zu extrem (weiß: {white_ratio:.2f}, schwarz: {black_ratio:.2f}), verwende Fallback")
+                logger.warning("Adaptive Threshold zu extrem, verwende gemischten Ansatz")
                 
-                # Fallback: Otsu mit sanfteren Einstellungen
-                _, result = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                # Kombiniere Otsu mit Adaptive
+                _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 
-                # Immer noch zu extrem? Verwende einfache Schwellwert
-                white_ratio = np.sum(result == 255) / result.size
-                if white_ratio > 0.95:
-                    threshold_value = np.mean(img) * 0.8  # 20% unter Durchschnitt
-                    _, result = cv2.threshold(img, threshold_value, 255, cv2.THRESH_BINARY)
+                # 60% Adaptive, 40% Otsu
+                alpha = 0.6
+                result = cv2.addWeighted(result, alpha, otsu, 1-alpha, 0)
+                result = np.where(result > 127, 255, 0).astype(np.uint8)
             
             return result
             
         except Exception as e:
-            logger.error(f"Binarisierung komplett fehlgeschlagen: {e}")
-            # Notfall-Fallback: Originalbild zurückgeben
-            return img
+            logger.error(f"Binarisierung fehlgeschlagen: {e}")
+            # Notfall-Fallback
+            _, result = cv2.threshold(img, np.mean(img), 255, cv2.THRESH_BINARY)
+            return result
     
     def process_image(self, file_bytes: bytes) -> bytes:
         """
