@@ -26,32 +26,32 @@ class DocumentType(Enum):
 class ProcessingConfig:
     """Konfiguration für verschiedene Dokumenttypen."""
     # Grundeinstellungen
-    target_width: int = 2000
-    angle_limit: float = 15.0
+    target_width: int = 1800  # Reduziert von 2000
+    angle_limit: float = 10.0  # Reduziert von 15.0
     
     # Rauschunterdrückung
-    noise_reduction_strength: float = 1.2
-    bilateral_d: int = 9
-    bilateral_sigma_color: float = 75
-    bilateral_sigma_space: float = 75
+    noise_reduction_strength: float = 0.8  # Reduziert von 1.2
+    bilateral_d: int = 5  # Reduziert von 9
+    bilateral_sigma_color: float = 50  # Reduziert von 75
+    bilateral_sigma_space: float = 50  # Reduziert von 75
     
     # Kontrast & Helligkeit
-    clahe_clip_limit: float = 3.0
-    clahe_tile_grid: Tuple[int, int] = (8, 8)
-    gamma_correction: float = 1.2
+    clahe_clip_limit: float = 2.0  # Reduziert von 3.0
+    clahe_tile_grid: Tuple[int, int] = (6, 6)  # Reduziert von (8, 8)
+    gamma_correction: float = 1.1  # Reduziert von 1.2
     
-    # Morphologie
-    opening_kernel_size: int = 2
-    closing_kernel_size: int = 1
+    # Morphologie (sehr sanft)
+    opening_kernel_size: int = 1  # Reduziert von 2
+    closing_kernel_size: int = 1  # Bleibt bei 1
     
-    # Schärfung
-    unsharp_radius: float = 1.5
-    unsharp_percent: int = 150
-    unsharp_threshold: int = 3
+    # Schärfung (sanfter)
+    unsharp_radius: float = 1.0  # Reduziert von 1.5
+    unsharp_percent: int = 120  # Reduziert von 150
+    unsharp_threshold: int = 5  # Erhöht von 3
     
     # Features
-    use_shadow_removal: bool = True
-    use_deblurring: bool = True
+    use_shadow_removal: bool = False  # Standardmäßig aus
+    use_deblurring: bool = False  # Standardmäßig aus
 
 # Konfigurationen für verschiedene Dokumenttypen
 CONFIGS = {
@@ -293,38 +293,37 @@ class StableImageProcessor:
             return None
     
     def multi_threshold_stable(self, img: np.ndarray) -> np.ndarray:
-        """Stabile Multi-Threshold nur mit OpenCV."""
-        methods = []
-        
+        """Sanfte Binarisierung mit Fallback."""
         try:
-            # Otsu
-            _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            methods.append(otsu)
-            
-            # Adaptive Gaussian
-            adapt_gauss = cv2.adaptiveThreshold(
+            # Erst versuchen: Einfaches Adaptive Threshold
+            result = cv2.adaptiveThreshold(
                 img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 31, 15
+                cv2.THRESH_BINARY, 31, 10
             )
-            methods.append(adapt_gauss)
             
-            # Adaptive Mean
-            adapt_mean = cv2.adaptiveThreshold(
-                img, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                cv2.THRESH_BINARY, 31, 15
-            )
-            methods.append(adapt_mean)
+            # Prüfe ob Ergebnis nicht komplett weiß/schwarz ist
+            white_ratio = np.sum(result == 255) / result.size
+            black_ratio = np.sum(result == 0) / result.size
             
-            # Ensemble-Entscheidung
-            if len(methods) >= 2:
-                combined = np.stack(methods, axis=2)
-                result = np.where(np.mean(combined, axis=2) > 127, 255, 0).astype(np.uint8)
-                return result
+            # Wenn zu extrem, verwende sanftere Einstellungen
+            if white_ratio > 0.95 or black_ratio > 0.95:
+                logger.warning(f"Threshold zu extrem (weiß: {white_ratio:.2f}, schwarz: {black_ratio:.2f}), verwende Fallback")
+                
+                # Fallback: Otsu mit sanfteren Einstellungen
+                _, result = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                # Immer noch zu extrem? Verwende einfache Schwellwert
+                white_ratio = np.sum(result == 255) / result.size
+                if white_ratio > 0.95:
+                    threshold_value = np.mean(img) * 0.8  # 20% unter Durchschnitt
+                    _, result = cv2.threshold(img, threshold_value, 255, cv2.THRESH_BINARY)
+            
+            return result
             
         except Exception as e:
-            logger.warning(f"Multi-Threshold fehlgeschlagen: {e}")
-        
-        return methods[0] if methods else img
+            logger.error(f"Binarisierung komplett fehlgeschlagen: {e}")
+            # Notfall-Fallback: Originalbild zurückgeben
+            return img
     
     def process_image(self, file_bytes: bytes) -> bytes:
         """
@@ -372,14 +371,26 @@ class StableImageProcessor:
             if self.config.gamma_correction != 1.0:
                 img_gray = self._apply_gamma(img_gray, self.config.gamma_correction)
             
-            # 10. Binarisierung
+            # 10. Sanfte Binarisierung
             binary_img = self.multi_threshold_stable(img_gray)
             
-            # 11. Morphologie
-            binary_img = self._morphology_cleanup(binary_img)
+            # Prüfe Ergebnis vor weiterer Verarbeitung
+            white_ratio = np.sum(binary_img == 255) / binary_img.size
+            logger.info(f"Binarisierung: {white_ratio:.2%} weiße Pixel")
             
-            # 12. Schärfung
-            final_img = self._sharpen_pil(binary_img)
+            # Wenn zu weiß, überspringe Morphologie und Schärfung
+            if white_ratio < 0.95:
+                # 11. Sehr sanfte Morphologie
+                binary_img = self._morphology_cleanup(binary_img)
+                
+                # 12. Sanfte Schärfung
+                final_img = self._sharpen_pil(binary_img)
+            else:
+                logger.warning("Bild zu weiß, überspringe Nachbearbeitung")
+                # Versuche weniger aggressive Binarisierung
+                threshold_val = np.percentile(img_gray, 20)  # 20% Perzentil als Schwellwert
+                _, binary_img = cv2.threshold(img_gray, threshold_val, 255, cv2.THRESH_BINARY)
+                final_img = Image.fromarray(binary_img)
             
             # 13. Export
             output_buffer = io.BytesIO()
@@ -439,26 +450,37 @@ class StableImageProcessor:
             return img
     
     def _morphology_cleanup(self, img: np.ndarray) -> np.ndarray:
-        """Morphologische Bereinigung."""
+        """Sehr sanfte morphologische Bereinigung."""
         try:
-            # Opening
-            if self.config.opening_kernel_size > 0:
-                kernel = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, 
-                    (self.config.opening_kernel_size, self.config.opening_kernel_size)
-                )
-                img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
+            # Prüfe zuerst ob Bild nicht schon zu weiß ist
+            white_ratio = np.sum(img == 255) / img.size
+            if white_ratio > 0.9:
+                logger.warning(f"Bild bereits zu weiß ({white_ratio:.2f}), überspringe Morphologie")
+                return img
             
-            # Closing
+            # Nur sehr kleine Kerne verwenden
+            if self.config.opening_kernel_size > 0:
+                kernel_size = min(self.config.opening_kernel_size, 2)  # Maximal 2x2
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            # Prüfe wieder nach Opening
+            white_ratio = np.sum(img == 255) / img.size
+            if white_ratio > 0.9:
+                logger.warning("Nach Opening zu weiß, überspringe Closing")
+                return img
+            
+            # Sehr sanftes Closing
             if self.config.closing_kernel_size > 0:
-                kernel = cv2.getStructuringElement(
-                    cv2.MORPH_RECT,
-                    (self.config.closing_kernel_size, self.config.closing_kernel_size)
-                )
-                img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+                kernel_size = min(self.config.closing_kernel_size, 1)  # Maximal 1x1
+                if kernel_size > 0:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                    img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel, iterations=1)
             
             return img
-        except:
+            
+        except Exception as e:
+            logger.warning(f"Morphologie fehlgeschlagen: {e}")
             return img
     
     def _sharpen_pil(self, img_array: np.ndarray) -> Image.Image:
