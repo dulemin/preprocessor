@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-numpy
-pillow
-opencv-python-headless
-python-multipart
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1     # für Datei-Upload (Form-Data)
+Pillow>=10.4,<11               # PNG/WebP usw.
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<5 # OpenCV ohne GUI-Dependencies
