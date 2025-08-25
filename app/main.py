@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Response
-from pipelines.photo import process_photo
-from pipelines.scan import process_scan
-from preprocess import preprocess_image as process_default
+from app.pipelines.photo import process_photo
+from app.pipelines.scan import process_scan
+from app.preprocess import preprocess_image as process_default
 
 app = FastAPI()
 
