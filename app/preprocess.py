@@ -1,344 +1,278 @@
 # app/preprocess.py
-"""
-Robuste Bildvorverarbeitung für OCR (nur OpenCV + Pillow).
-- Vermeidet Überkontrast bei Handyfotos (sanftere Beleuchtungskorrektur)
-- Deskew nur in kleinem Winkelbereich (kein "45°-Kippen")
-- Adaptive Binarisierung mit Fallback, falls zu "weiß"
-- Sehr vorsichtige Morphologie & Schärfung
-"""
-
-from __future__ import annotations
 import io
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
-import cv2  # OpenCV
+import cv2
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance  # Pillow
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
+# ---------- Konfiguration ----------
 
-# -----------------------------
-#   Konfiguration / Typen
-# -----------------------------
-
-class DocumentType(Enum):
+class DocKind(Enum):
     SCANNED = "scanned"
-    PHOTOGRAPHED = "photographed"
-    PRINTED = "printed"
-    HANDWRITTEN = "handwritten"
+    PHOTO = "photographed"
     MIXED = "mixed"
 
-
 @dataclass
-class ProcessingConfig:
-    # Auflösung & DPI (Tesseract fühlt sich bei 300dpi wohl)
-    target_width: int = 2400
-    target_dpi: int = 300
+class Cfg:
+    target_width: int = 2400        # für kleine Schriftzeichen
+    target_dpi: int = 300           # tesseract-freundlich
+    angle_limit: float = 10.0       # maximale Deskew-Korrektur
 
-    # Schräglage: wir korrigieren nur kleine Winkel (kein 90°-Turn)
-    angle_limit: float = 10.0  # Grad
-
-    # Rauschen
+    # Entrauschen
     bilateral_d: int = 5
-    bilateral_sigma_color: float = 50
-    bilateral_sigma_space: float = 50
-    noise_reduction_extra: bool = False  # optionaler zusätzlicher Blur
+    bilateral_sigma_color: int = 50
+    bilateral_sigma_space: int = 50
 
-    # Beleuchtung / Kontrast
-    clahe_clip_limit: float = 2.0
-    clahe_tile_grid: Tuple[int, int] = (8, 8)
-    gamma: float = 1.0  # 1.0 = aus
+    # CLAHE (sanft für Fotos)
+    clahe_clip: float = 2.0
+    clahe_grid: Tuple[int, int] = (8, 8)
+
+    # Adaptive Threshold
+    sauvola_win: int = 31           # ungerade
+    sauvola_k: float = 0.2          # 0.2–0.34 üblich
+    sauvola_r: float = 128.0
 
     # Morphologie
     open_size: int = 1
-    close_size: int = 2
+    close_size: int = 1
 
     # Schärfen
     unsharp_radius: float = 0.8
     unsharp_percent: int = 140
     unsharp_threshold: int = 2
 
-    # Feature-Flags
-    use_shadow_removal: bool = True
-    use_deblurring: bool = False
-    use_text_enhancement: bool = True
+# ---------- Hilfen ----------
 
+def _pil_to_cv(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-def _cfg_for(doc: DocumentType) -> ProcessingConfig:
-    if doc == DocumentType.SCANNED:
-        return ProcessingConfig(
-            target_width=2200, use_shadow_removal=False,
-            clahe_clip_limit=1.4, gamma=1.0, use_text_enhancement=True
-        )
-    if doc == DocumentType.PHOTOGRAPHED:
-        return ProcessingConfig(
-            target_width=2600, use_shadow_removal=True,
-            clahe_clip_limit=2.2, gamma=1.1, use_text_enhancement=True
-        )
-    if doc == DocumentType.PRINTED:
-        return ProcessingConfig(
-            target_width=2400, use_shadow_removal=True,
-            clahe_clip_limit=1.8, gamma=1.05, use_text_enhancement=True
-        )
-    if doc == DocumentType.HANDWRITTEN:
-        return ProcessingConfig(
-            target_width=2800, use_shadow_removal=True,
-            close_size=3, unsharp_percent=160, unsharp_threshold=1,
-            clahe_clip_limit=1.8, use_text_enhancement=True
-        )
-    return ProcessingConfig()  # MIXED / Fallback
+def _cv_to_pil(arr: np.ndarray) -> Image.Image:
+    if len(arr.shape) == 2:
+        return Image.fromarray(arr)
+    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
 
+def _ensure_odd(n: int) -> int:
+    return n if n % 2 == 1 else n + 1
 
-# -----------------------------
-#   Hilfsfunktionen
-# -----------------------------
+def _scale_to_width(img: Image.Image, target_w: int) -> Image.Image:
+    if img.width >= target_w:
+        return img
+    s = target_w / img.width
+    return img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
 
-def _pil_to_gray(img_rgb: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(img_rgb), cv2.COLOR_RGB2GRAY)
+def _local_contrast_std(gray: np.ndarray, win: int = 31) -> float:
+    m = cv2.boxFilter(gray.astype(np.float32), ddepth=-1, ksize=(win, win),
+                      normalize=True, borderType=cv2.BORDER_REPLICATE)
+    m2 = cv2.boxFilter((gray.astype(np.float32) ** 2), ddepth=-1, ksize=(win, win),
+                       normalize=True, borderType=cv2.BORDER_REPLICATE)
+    var = np.maximum(m2 - m * m, 0.0)
+    return float(np.mean(np.sqrt(var)))
 
+def _illumination_correct(gray: np.ndarray) -> np.ndarray:
+    # morphologisches Opening für Hintergrundschätzung + Division
+    k = max(min(gray.shape) // 30, 15)
+    k = _ensure_odd(k)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bg = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+    bg = np.clip(bg, 1, 255)
+    norm = cv2.divide(gray, bg, scale=255)
+    return norm.astype(np.uint8)
 
-def _resize_for_ocr(img: Image.Image, target_width: int) -> Image.Image:
-    if img.width < target_width:
-        s = target_width / img.width
-        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
-    return img
+def _auto_gamma(gray: np.ndarray, p_low=2, p_high=98) -> np.ndarray:
+    lo = np.percentile(gray, p_low)
+    hi = np.percentile(gray, p_high)
+    if hi <= lo + 1:
+        return gray
+    out = np.clip((gray - lo) * (255.0 / (hi - lo)), 0, 255)
+    return out.astype(np.uint8)
 
+def _fast_denoise(gray: np.ndarray) -> np.ndarray:
+    # bilateral ist robust, fastNlMeans ist optional (gleiches Ergebnis für beide Fälle)
+    try:
+        den = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+        return den
+    except Exception:
+        return cv2.bilateralFilter(gray, 5, 50, 50)
 
-def _bilateral_denoise(img: np.ndarray, cfg: ProcessingConfig) -> np.ndarray:
-    out = cv2.bilateralFilter(img, cfg.bilateral_d, cfg.bilateral_sigma_color, cfg.bilateral_sigma_space)
-    if cfg.noise_reduction_extra:
-        k = 3 | 1  # ungerade
-        out = cv2.GaussianBlur(out, (k, k), 0)
+# ---------- Sauvola / Niblack (ohne Zusatz-Module) ----------
+
+def _mean_std(gray: np.ndarray, win: int) -> Tuple[np.ndarray, np.ndarray]:
+    f32 = gray.astype(np.float32)
+    ksize = (_ensure_odd(win), _ensure_odd(win))
+    mean = cv2.boxFilter(f32, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    mean_sq = cv2.boxFilter(f32 * f32, -1, ksize, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    var = np.maximum(mean_sq - mean * mean, 0.0)
+    std = np.sqrt(var)
+    return mean, std
+
+def sauvola_binarize(gray: np.ndarray, w: int = 31, k: float = 0.2, r: float = 128.0) -> np.ndarray:
+    mean, std = _mean_std(gray, w)
+    thresh = mean * (1.0 + k * ((std / r) - 1.0))
+    out = (gray.astype(np.float32) > thresh).astype(np.uint8) * 255
     return out
 
+# ---------- Deskew + Orientierung ----------
 
-def _shadow_removal(img: np.ndarray, cfg: ProcessingConfig) -> np.ndarray:
-    """
-    Sanfte Hintergrundschätzung: morph. Öffnen + Division + leichte CLAHE.
-    (Vermeidet harte Weißflächen bei Fotos.)
-    """
-    try:
-        h, w = img.shape[:2]
-        k = max(15, min(h, w) // 30)  # kleiner Kernel als früher
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        bg = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
-        norm = cv2.divide(img, bg, scale=255)
-        mixed = cv2.addWeighted(norm, 0.7, img, 0.3, 0)
+def _deskew_angle(gray: np.ndarray) -> float:
+    # Kanten → HoughLinesP → Winkel-Median
+    v = np.median(gray)
+    lower = int(max(0, 0.66 * v))
+    upper = int(min(255, 1.33 * v))
+    edges = cv2.Canny(gray, lower, upper)
 
-        clahe = cv2.createCLAHE(clipLimit=cfg.clahe_clip_limit, tileGridSize=cfg.clahe_tile_grid)
-        return clahe.apply(mixed.astype(np.uint8))
-    except Exception as e:
-        logger.warning(f"Shadow removal failed: {e}")
-        return img
-
-
-def _apply_gamma(img: np.ndarray, gamma: float) -> np.ndarray:
-    if gamma == 1.0:
-        return img
-    inv = 1.0 / gamma
-    tbl = (np.arange(256) / 255.0) ** inv * 255.0
-    return cv2.LUT(img, tbl.astype(np.uint8))
-
-
-def _deskew_angle_hough(gray: np.ndarray) -> Optional[float]:
-    # adaptive Canny
-    v = np.median(gray); sigma = 0.33
-    lo = int(max(0, (1.0 - sigma) * v)); hi = int(min(255, (1.0 + sigma) * v))
-    edges = cv2.Canny(gray, lo, hi)
-
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=max(50, gray.shape[1] // 15),
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=max(50, gray.shape[1] // 15),
                             minLineLength=gray.shape[1] // 8, maxLineGap=gray.shape[1] // 30)
     if lines is None:
-        return None
-    angles: List[float] = []
-    for (x1, y1, x2, y2) in lines[:, 0, :]:
-        ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        if ang > 45: ang -= 90
-        if ang < -45: ang += 90
-        if -15 <= ang <= 15:
-            angles.append(ang)
-    if len(angles) < 3:
-        return None
-    return float(np.median(angles))
+        return 0.0
 
+    angs = []
+    for l in lines[:150]:
+        x1, y1, x2, y2 = l[0]
+        a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if a > 45:   a -= 90
+        if a < -45:  a += 90
+        if -20 <= a <= 20:
+            angs.append(a)
+    if not angs:
+        return 0.0
+    return float(np.median(angs))
 
-def _deskew_angle_contours(gray: np.ndarray) -> Optional[float]:
-    try:
-        _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        cnts, _ = cv2.findContours(binv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = [c for c in cnts if cv2.contourArea(c) > 100]
-        if not cnts:
-            return None
-        angles = []
-        for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:10]:
-            angle = cv2.minAreaRect(c)[-1]
-            if angle < -45: angle = 90 + angle
-            if -15 <= angle <= 15:
-                angles.append(angle)
-        if len(angles) < 2:
-            return None
-        return float(np.median(angles))
-    except Exception:
-        return None
-
-
-def _rotate_keep_size(gray: np.ndarray, angle: float) -> np.ndarray:
+def _rotate(gray: np.ndarray, angle: float) -> np.ndarray:
     h, w = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
     return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC,
                           borderMode=cv2.BORDER_CONSTANT, borderValue=255)
 
+def _best_90deg_orientation(bin_img: np.ndarray) -> np.ndarray:
+    # wähle Rotation (0,90,180,270) mit größter Varianz der horizontalen Projektion
+    candidates = [
+        bin_img,
+        cv2.rotate(bin_img, cv2.ROTATE_90_CLOCKWISE),
+        cv2.rotate(bin_img, cv2.ROTATE_180),
+        cv2.rotate(bin_img, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+    scores = []
+    for b in candidates:
+        # Zähle schwarze Pixel pro Zeile → Varianz hoch, wenn Textzeilen horizontal liegen
+        proj = np.sum(b == 0, axis=1).astype(np.float32)
+        scores.append(float(np.var(proj)))
+    return candidates[int(np.argmax(scores))]
 
-def _adaptive_binary(gray: np.ndarray) -> np.ndarray:
-    """
-    Adaptive Threshold mit Fenstergröße abhängig von der Auflösung +
-    Fallback, wenn Ergebnis zu weiß/schwarz ist.
-    """
-    block = max(31, min(gray.shape) // 15)
-    if block % 2 == 0:
-        block += 1
-    result = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, block, 8)
-    white = (result == 255).mean()
-    if white > 0.95 or white < 0.05:
-        # Mischung mit Otsu, wenn zu extrem
+# ---------- Binarisierung (mit Auto-Fallback) ----------
+
+def _adaptive_binarize(gray: np.ndarray, cfg: Cfg, photo_like: bool) -> np.ndarray:
+    if photo_like:
+        # sanfte Korrekturen vor adaptive Threshold
+        gray2 = _illumination_correct(gray)
+        gray2 = _auto_gamma(gray2, 2, 98)
+        # Sauvola (stabil bei ungleichmäßiger Beleuchtung)
+        binimg = sauvola_binarize(gray2, w=cfg.sauvola_win, k=cfg.sauvola_k, r=cfg.sauvola_r)
+    else:
+        # Scans: meist homogen → Otsu mit leichtem CLAHE
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=cfg.clahe_grid)
+        g = clahe.apply(gray)
+        _, binimg = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Überfüllung prüfen → Parameter nachjustieren
+    white_ratio = np.mean(binimg == 255)
+    if white_ratio > 0.97 or white_ratio < 0.03:
+        # Fallback-Mix: 60% adaptive, 40% Otsu
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        result = cv2.addWeighted(result, 0.6, otsu, 0.4, 0)
-        result = (result > 127).astype(np.uint8) * 255
-    return result
+        binimg = cv2.addWeighted(binimg, 0.6, otsu, 0.4, 0)
+        binimg = np.where(binimg > 127, 255, 0).astype(np.uint8)
+    return binimg
 
+# ---------- Hauptpipeline ----------
 
-def _morph_cleanup(binimg: np.ndarray, cfg: ProcessingConfig) -> np.ndarray:
-    white = (binimg == 255).mean()
-    if white > 0.90:
-        return binimg  # schon sehr weiß -> nichts tun
+def _detect_kind(gray: np.ndarray) -> DocKind:
+    # grobe Heuristik: hohe lokale Std + Helligkeitsschwankungen → Foto
+    lc = _local_contrast_std(gray, 31)
+    # Helligkeitsschwankung über große Skala
+    big = cv2.GaussianBlur(gray, (0, 0), sigmaX=21, sigmaY=21)
+    fluct = float(np.std(big))
+    if lc > 18 or fluct > 18:   # konservative Schwellwerte
+        return DocKind.PHOTO
+    # sehr homogen
+    if lc < 10 and fluct < 10:
+        return DocKind.SCANNED
+    return DocKind.MIXED
 
-    out = binimg
+def _morphology_smooth(binimg: np.ndarray, cfg: Cfg) -> np.ndarray:
+    # nur sehr kleine Kerne, sonst „weißwaschen“ wir das Bild
     if cfg.open_size > 0:
-        k = min(cfg.open_size, 2)
-        out = cv2.morphologyEx(out, cv2.MORPH_OPEN,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), iterations=1)
-    if cfg.close_size > 0 and (out == 255).mean() < 0.90:
-        k = min(cfg.close_size, 2)
-        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)), iterations=1)
-    return out
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_size, cfg.open_size))
+        binimg = cv2.morphologyEx(binimg, cv2.MORPH_OPEN, k, iterations=1)
+    if cfg.close_size > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.close_size, cfg.close_size))
+        binimg = cv2.morphologyEx(binimg, cv2.MORPH_CLOSE, k, iterations=1)
+    return binimg
 
-
-def _unsharp_pil(binimg: np.ndarray, cfg: ProcessingConfig) -> Image.Image:
+def _gentle_sharpen(binimg: np.ndarray, cfg: Cfg) -> Image.Image:
     pil = Image.fromarray(binimg)
-    sharp = pil.filter(ImageFilter.UnsharpMask(
+    pil = pil.filter(ImageFilter.UnsharpMask(
         radius=cfg.unsharp_radius, percent=cfg.unsharp_percent, threshold=cfg.unsharp_threshold
     ))
-    # leichte Kantanhebung + minimale Kontrastanhebung
-    edge = sharp.filter(ImageFilter.EDGE_ENHANCE)
-    mixed = cv2.addWeighted(np.array(sharp), 0.85, np.array(edge), 0.15, 0)
-    res = Image.fromarray(np.clip(mixed, 0, 255).astype(np.uint8))
-    return ImageEnhance.Contrast(res).enhance(1.03)
-
-
-def _doc_type(gray: np.ndarray) -> DocumentType:
-    """
-    Sehr einfache Heuristiken:
-    - Kantendichte (Canny)
-    - Varianz des Laplacian (Schärfemaß)
-    - mittlere Helligkeit
-    """
-    edges = cv2.Canny(gray, 50, 150)
-    edge_density = (edges > 0).mean()
-    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    mean_b = gray.mean()
-
-    if edge_density < 0.02 and lap_var > 900 and mean_b > 200:
-        return DocumentType.SCANNED
-    if edge_density > 0.05 and lap_var < 600:
-        return DocumentType.PHOTOGRAPHED
-    if edge_density > 0.025 and lap_var > 800:
-        return DocumentType.PRINTED
-    return DocumentType.MIXED
-
-
-# -----------------------------
-#   Haupt-Pipeline
-# -----------------------------
+    pil = ImageEnhance.Contrast(pil).enhance(1.03)  # ganz leicht
+    return pil
 
 def preprocess_image(file_bytes: bytes) -> bytes:
-    """
-    Lädt Bildbytes → RGB → Graustufen → Vorverarbeitung → PNG (300dpi).
-    Gibt PNG-Bytes zurück (für n8n HTTP Response Binary).
-    """
+    cfg = Cfg()
     try:
+        # 1) Laden + EXIF-Orientation
         with Image.open(io.BytesIO(file_bytes)) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
 
-        # 1) für OCR hochskalieren (falls nötig)
-        im = _resize_for_ocr(im, target_width=2400)
+        # 2) OCR-freundliche Größe
+        im = _scale_to_width(im, cfg.target_width)
 
-        # 2) Graustufen
-        gray = _pil_to_gray(im)
+        # 3) nach CV2
+        gray = cv2.cvtColor(_pil_to_cv(im), cv2.COLOR_BGR2GRAY)
 
-        # 3) Dokumenttyp + passende Config
-        dtype = _doc_type(gray)
-        cfg = _cfg_for(dtype)
-        logger.info(f"Document type detected: {dtype.value}")
+        # 4) sanft entrauschen
+        gray = _fast_denoise(gray)
 
-        # 4) Rauschen
-        gray = _bilateral_denoise(gray, cfg)
+        # 5) Dokument-Charakteristik
+        kind = _detect_kind(gray)
+        photo_like = (kind == DocKind.PHOTO or kind == DocKind.MIXED)
 
-        # 5) Beleuchtung (für Fotos sanft, für Scans meist aus)
-        if cfg.use_shadow_removal:
-            gray = _shadow_removal(gray, cfg)
+        # 6) Deskew (kleiner Winkel)
+        angle = np.clip(_deskew_angle(gray), -cfg.angle_limit, cfg.angle_limit)
+        if abs(angle) > 0.2:
+            gray = _rotate(gray, angle)
 
-        # 6) Gamma (sanft, um „ausgefressene“ Bereiche zu vermeiden)
-        gray = _apply_gamma(gray, cfg.gamma)
+        # 7) Adaptive Binarisierung mit Auto-Fallback
+        binimg = _adaptive_binarize(gray, cfg, photo_like=photo_like)
 
-        # 7) Deskew (nur kleiner Winkel; verhindert „45°“-Effekt)
-        a1 = _deskew_angle_hough(gray)
-        a2 = _deskew_angle_contours(gray)
-        angles = [a for a in [a1, a2] if a is not None]
-        if angles:
-            ang = float(np.median(angles))
-            ang = float(np.clip(ang, -cfg.angle_limit, cfg.angle_limit))
-            if abs(ang) > 0.2:
-                gray = _rotate_keep_size(gray, ang)
-                logger.info(f"Deskew: {ang:.2f}°")
+        # 8) Orientierung in 90°-Schritten prüfen (fix für „um 90° gedreht“)
+        binimg = _best_90deg_orientation(binimg)
 
-        # 8) Binarisierung (adaptive + Fallback)
-        binimg = _adaptive_binary(gray)
-        white_ratio = (binimg == 255).mean()
-        logger.info(f"Binary white ratio: {white_ratio:.2%}")
-
-        # 9) (optional) Text-Enhancement als sehr sanfte Morphologie
-        if cfg.use_text_enhancement and white_ratio < 0.95:
-            binimg = _morph_cleanup(binimg, cfg)
-
-        # 10) sanftes Schärfen
-        if white_ratio < 0.95:
-            out_img = _unsharp_pil(binimg, cfg)
+        # 9) Leichte Morphologie + Schärfen (nur falls nicht „fast nur weiß“)
+        if np.mean(binimg == 255) < 0.97:
+            binimg = _morphology_smooth(binimg, cfg)
+            out_pil = _gentle_sharpen(binimg, cfg)
         else:
-            # Wenn zu weiß geworden ist, nutze „milderes“ statisches Schwellwerten
-            t = np.percentile(gray, 20)
-            _, tmp = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
-            out_img = Image.fromarray(tmp)
+            out_pil = Image.fromarray(binimg)
 
-        # 11) PNG mit DPI speichern
+        # 10) PNG mit DPI
         buf = io.BytesIO()
-        out_img.save(buf, format="PNG", optimize=True, compress_level=6, dpi=(cfg.target_dpi, cfg.target_dpi))
+        out_pil.save(buf, format="PNG", optimize=True, compress_level=6,
+                     dpi=(cfg.target_dpi, cfg.target_dpi))
         return buf.getvalue()
 
     except Exception as e:
-        logger.error(f"Preprocess failed: {e}")
-        # Minimaler Fallback: nur nach L konvertieren
+        logger.exception(f"Preprocessing error: {e}")
+        # Fallback: Graustufen-PNG
         try:
             with Image.open(io.BytesIO(file_bytes)) as im:
                 im = ImageOps.exif_transpose(im).convert("L")
-                b = io.BytesIO()
-                im.save(b, format="PNG")
-                return b.getvalue()
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                return buf.getvalue()
         except Exception:
             raise
