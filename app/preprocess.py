@@ -1,109 +1,100 @@
 # app/preprocess.py
 import io
+import math
 import cv2
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps
 
+def _pil_to_cv2(img_pil: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-def _pil_to_cv2_rgb(pil_img: Image.Image) -> np.ndarray:
-    """PIL RGB -> OpenCV BGR (uint8)."""
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+def _cv2_to_pil(img_cv: np.ndarray) -> Image.Image:
+    # img_cv is BGR or Gray; ensure RGB/ L for PIL
+    if len(img_cv.shape) == 2:
+        return Image.fromarray(img_cv)  # 'L'
+    return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
 
+def _resize_to_width(img_pil: Image.Image, target_w: int = 1800) -> Image.Image:
+    if img_pil.width >= target_w:
+        return img_pil
+    scale = target_w / img_pil.width
+    new_size = (int(img_pil.width * scale), int(img_pil.height * scale))
+    return img_pil.resize(new_size, Image.LANCZOS)
 
-def _compute_skew_angle(img_gray: np.ndarray) -> float:
+def _estimate_skew_deg(gray: np.ndarray) -> float:
     """
-    Robust: erst Hough-Linien (horizontale Textzeilen), sonst Fallback minAreaRect.
-    Rückgabe in Grad, positiv = gegen Uhrzeigersinn.
+    Robust Skew-Schätzung über Hough-Linien.
+    Wir suchen dominante quasi-horizontale Linien und mitteln den Winkel.
+    Rückgabe in Grad. Positiv = im Uhrzeigersinn drehen nötig.
     """
-    # 1) Hough-basierter Versuch
-    # Kanten -> HoughLinesP -> Winkel der (nahezu) horizontalen Linien sammeln
-    edges = cv2.Canny(img_gray, 60, 180)
-    h, w = img_gray.shape[:2]
-    min_len = int(0.25 * min(h, w))   # nur längere Linien
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=min_len, maxLineGap=20)
-
-    angles = []
-    if lines is not None:
-        for l in lines[:2000]:
-            x1, y1, x2, y2 = l[0]
-            ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-            # nur (nahezu) horizontal berücksichtigen
-            if -30 <= ang <= 30:
-                angles.append(ang)
-
-    if len(angles) >= 5:
-        # Median ist robust gegen Ausreißer
-        return float(np.median(angles))
-
-    # 2) Fallback: minAreaRect über Textmaske (nach Otsu + Open)
-    thr = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, cv2.getStructuringElement(
-        cv2.MORPH_RECT, (3, 3)), iterations=1)
-    coords = np.column_stack(np.where(thr > 0))
-    if coords.size == 0:
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=120)
+    if lines is None:
         return 0.0
 
-    rect = cv2.minAreaRect(coords)
-    angle = rect[-1]  # in [-90, 0)
-    # auf [-45, 45) normalisieren
-    if angle < -45:
-        angle = 90 + angle
-    # z. B. -7.3 ... +7.3
-    return float(angle)
+    angles = []
+    for rho, theta in lines[:, 0]:
+        # theta nahe 0° oder 180° -> vertikale Linien; nahe 90° -> horizontale.
+        # Wir wollen horizontale (Textzeilen), daher um 90° zentrieren:
+        ang = (theta * 180.0 / np.pi) - 90.0
+        # horizontnah (|ang| <= 20°), aber ignoriere diagonale Kästchen (~45°)
+        if abs(ang) <= 20.0 and abs(abs(ang) - 45.0) > 5.0:
+            angles.append(ang)
 
+    if not angles:
+        return 0.0
+    # Median ist robuster als Mittelwert
+    ang_med = float(np.median(angles))
+    # Text “nach rechts fallend” (negativ) bedeutet: Gegenuhrzeigersinn drehen,
+    # wir definieren positiv als "im Uhrzeigersinn drehen nötig":
+    return -ang_med
+
+def _safe_deskew(gray: np.ndarray) -> np.ndarray:
+    """
+    Drehe nur, wenn der geschätzte Skew klein ist (|angle| <= 5°).
+    Vermeidet 45°-Fehldrehungen bei Formular-Kästchen.
+    """
+    angle = _estimate_skew_deg(gray)
+    if abs(angle) < 0.4:  # < ~0.4°: vernachlässigbar
+        return gray
+
+    if abs(angle) > 5.0:
+        # Zu unsicher/groß – Tesseract mit OSD erledigt das besser.
+        return gray
+
+    h, w = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 def preprocess_image(file_bytes: bytes) -> bytes:
-    """
-    - EXIF-Orientierung respektieren
-    - ggf. hochskalieren (bessere OCR)
-    - Deskew mit Hough-Fallback (clamped)
-    - Adaptive Threshold + leichtes Schärfen
-    - Ausgabe: PNG-Bytes (1-Kanal)
-    """
-    # 1) Laden (EXIF) und nach RGB
+    # 1) Laden + EXIF-Orientierung
     img = Image.open(io.BytesIO(file_bytes))
     img = ImageOps.exif_transpose(img).convert("RGB")
 
-    # 2) ggf. hochskalieren (Breite ~1800 px)
-    target_w = 1800
-    if img.width < target_w:
-        scale = target_w / img.width
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    # 2) Auf sinnvolle Breite hochskalieren (OCR profitiert von ~300dpi)
+    img = _resize_to_width(img, 1800)
 
-    # 3) nach Graustufen (OpenCV) und leicht glätten
-    img_bgr = _pil_to_cv2_rgb(img)
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    img_gray = cv2.medianBlur(img_gray, 3)
+    # 3) Nach OpenCV, Graustufen + leichter Rauschfilter
+    img_cv = _pil_to_cv2(img)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 3)
 
-    # 4) Deskew (mit Begrenzung auf sinnvollen Bereich)
-    angle = _compute_skew_angle(img_gray)
-    ANGLE_LIMIT = 12.0  # harte Begrenzung gegen Fehlrotationen
-    if angle > ANGLE_LIMIT:
-        angle = ANGLE_LIMIT
-    elif angle < -ANGLE_LIMIT:
-        angle = -ANGLE_LIMIT
+    # 4) Lokalen Kontrast erhöhen (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
 
-    if abs(angle) > 0.1:
-        h, w = img_gray.shape[:2]
-        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-        img_gray = cv2.warpAffine(
-            img_gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-        )
+    # 5) Nur vorsichtig deskewen
+    gray = _safe_deskew(gray)
 
-    # 5) Adaptive Threshold + kleine Morphologie
-    thr = cv2.adaptiveThreshold(
-        img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
-    )
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, cv2.getStructuringElement(
-        cv2.MORPH_RECT, (1, 1)), iterations=1)
+    # 6) Opportunistische Binarisierung – nur wenn der Otsu-Output "gesund" ist
+    #    (zu viel Weiß oder Schwarz -> lieber Graustufe lassen, Tesseract binarisiert selbst)
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    white_ratio = float(np.mean(otsu) / 255.0)
+    use_binary = 0.30 < white_ratio < 0.88  # Daumenregel
 
-    # 6) leichtes Nachschärfen im PIL
-    pil_bin = Image.fromarray(thr).filter(
-        ImageFilter.UnsharpMask(radius=1.0, percent=140, threshold=3)
-    )
-
-    # 7) PNG zurückgeben
     out = io.BytesIO()
-    pil_bin.save(out, format="PNG", optimize=True)
+    if use_binary:
+        _cv2_to_pil(otsu).save(out, format="PNG", optimize=True)
+    else:
+        _cv2_to_pil(gray).save(out, format="PNG", optimize=True)
     return out.getvalue()
