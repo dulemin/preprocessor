@@ -4,51 +4,58 @@ import numpy as np
 from PIL import Image, ImageOps, ImageFilter
 
 def process_photo(file_bytes: bytes) -> bytes:
-    # 1. Laden und normalisieren
+    # 1. Laden und EXIF orientieren
     img = Image.open(io.BytesIO(file_bytes))
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = ImageOps.exif_transpose(img)
 
-    # 2. Auflösung erhöhen
+    # 2. Immer RGB, falls nicht schon
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # 3. Auflösung erhöhen
     target_w = 1800
     if img.width < target_w:
         scale = target_w / img.width
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img = img.resize(
+            (int(img.width * scale), int(img.height * scale)),
+            Image.LANCZOS
+        )
 
-    # 3. In Graustufen umwandeln
-    gray = np.array(img.convert("L"), dtype=np.uint8)  # garantiert 1 Kanal
+    # 4. Graustufen erzwingen
+    img_gray_pil = img.convert("L")
+    img_gray = np.array(img_gray_pil, dtype=np.uint8)
 
-    # 4. Deskew (optional – hier einfache Version, um sicher Graubild zu behalten)
+    # Sicherheit: prüfen, dass 2D
+    if img_gray.ndim != 2:
+        img_gray = cv2.cvtColor(img_gray, cv2.COLOR_BGR2GRAY)
+
+    # 5. Leicht entrauschen
+    img_gray = cv2.medianBlur(img_gray, 3)
+
+    # 6. Adaptive Threshold mit Fallback
     try:
-        thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-        edges = cv2.Canny(thr, 50, 150, apertureSize=3)
-        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=100)
-        if lines is not None:
-            angles = [np.degrees(theta) - 90 for _, theta in lines[:, 0]]
-            angle = np.median(angles)
-            (h, w) = gray.shape[:2]
-            M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-            gray = cv2.warpAffine(gray, M, (w, h),
-                                  flags=cv2.INTER_CUBIC,
-                                  borderMode=cv2.BORDER_REPLICATE)
-    except Exception as e:
-        print(f"Deskew skipped: {e}")
+        bw = cv2.adaptiveThreshold(
+            img_gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            35, 15
+        )
+    except cv2.error as e:
+        print("⚠️ OpenCV adaptiveThreshold failed, fallback to Otsu:", e)
+        _, bw = cv2.threshold(
+            img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
 
-    # 5. Adaptive Threshold – jetzt garantiert Graubild
-    bw = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        35, 15
-    )
-
-    # 6. Morphologische Reinigung
+    # 7. Morphologische Glättung
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # 7. Leicht schärfen
-    pil_bin = Image.fromarray(bw).filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3))
+    # 8. Schärfen
+    pil_bin = Image.fromarray(bw).filter(
+        ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3)
+    )
 
-    # 8. Zurückgeben als PNG
+    # 9. Ausgabe als PNG
     out = io.BytesIO()
     pil_bin.save(out, format="PNG", optimize=True)
     return out.getvalue()
